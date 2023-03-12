@@ -6,6 +6,7 @@ import os
 import random
 from itertools import chain
 from pathlib import Path
+import numpy as np
 
 import datasets
 import torch
@@ -36,32 +37,28 @@ from transformers.utils.versions import require_version
 
 logger = get_logger(__name__)
 
-def fl_partition(num):
-    num_files = num
-    with open('data/val.txt') as in_file:
-        lines = in_file.readlines()
-        lines_per_file = len(lines) // num_files
-        for n in range(num_files):
-            with open('data/partition/val{}.txt'.format(n+1), 'w') as out_file:
-                for i in range(n * lines_per_file, (n+1) * lines_per_file):
-                    out_file.write(lines[i])
-                    
-    with open('data/train.txt') as in_file:
-        lines = in_file.readlines()
-        lines_per_file = len(lines) // num_files
-        for n in range(num_files):
-            with open('data/partition/train{}.txt'.format(n+1), 'w') as out_file:
-                for i in range(n * lines_per_file, (n+1) * lines_per_file):
-                    out_file.write(lines[i])
-                    if i > (n * lines_per_file ):
-                        break
+def fl_partition(cid, train_len, eval_len, num_clients, alpha = 1, beta=100):
+ 
+    def a_i(T, i):
+        return int(T/num_clients + (2 * i - num_clients - 1) / 2 * np.log(alpha) * T / beta)
+
+    cid = int(cid)
+    t_1 = int(train_len / num_clients - (num_clients - 1) / 2 * np.log(alpha) * train_len / beta)
+    e_1 = int(eval_len / num_clients - (num_clients - 1) / 2 * np.log(alpha) * eval_len / beta)
+    train_range, eval_range = [0, max(t_1, 1)], [0, max(e_1, 1)]
+    for n in range(num_clients-1):
+        train_range.append(train_range[n+1] + a_i(train_len, n+2))
+        eval_range.append(eval_range[n+1] + a_i(eval_len, n+2))
+    train_range[-1] = train_len
+    eval_range[-1] = eval_len
+
+    print(train_range)
+    print(eval_range)
     
-    return "data/partition/"
+    return train_range[cid:(cid+2)], eval_range[cid:(cid+2)]
 
 def initialise(args):
-    
-   
-            
+               
     config = AutoConfig.from_pretrained(args.model_name_or_path, num_labels=3, finetuning_task=args.task_name)
     #tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=not args.use_slow_tokenizer)
     model = AutoModelForSequenceClassification.from_pretrained(
@@ -274,3 +271,8 @@ def test(args, model, eval_dataloader, device, eval_range):
             json.dump(all_results, f)'''
             
     return float(eval_loss), eval_metric
+
+if __name__ == "__main__":
+    print(1)
+    fl_partition("0", 10000, 100, 5, alpha = 100000)
+

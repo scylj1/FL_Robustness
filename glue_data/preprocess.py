@@ -20,7 +20,7 @@ import math
 import os
 import random
 from pathlib import Path
-
+import numpy as np
 import datasets
 import evaluate
 import torch
@@ -76,6 +76,22 @@ def parse_args():
         default=None,
         help="The name of the glue task to train on.",
         choices=list(task_to_keys.keys()),
+    )
+    parser.add_argument(
+        "--alpha",
+        type=int,
+        default=1,
+        help=(
+            "increase alpha to create label distribution skew"
+        ),
+    )
+    parser.add_argument(
+        "--beta",
+        type=int,
+        default=35,
+        help=(
+            "decrease beta to create label distribution skew"
+        ),
     )
     parser.add_argument(
         "--train_file", type=str, default=None, help="A csv or a json file containing the training data."
@@ -193,6 +209,7 @@ def parse_args():
         action="store_true",
         help="Whether or not to enable to load a pretrained model whose head dimensions are different.",
     )
+    parser.add_argument("--do_noniid", type=bool, default=False)
     args = parser.parse_args()
 
     # Sanity checks
@@ -291,6 +308,22 @@ def main():
     # See more about loading any type of standard or custom dataset at
     # https://huggingface.co/docs/datasets/loading_datasets.html.
 
+    if args.do_noniid:
+        num_label1 = int((np.log(args.alpha) / args.beta + 1 / 2) * args.per_device_train_batch_size)
+        num_label2 = args.per_device_train_batch_size - num_label1
+        raw_datasets["train"] = raw_datasets["train"].sort('label')
+        num_rows = raw_datasets["train"].num_rows
+        print(f"debug{num_label1}")
+        def switch(arr, i):
+            tmp = arr[i]
+            arr[i] = arr[num_rows-1-i]
+            arr[num_rows-1-i] = tmp
+        index = [i for i in range(num_rows)]
+        for i in range(num_rows // 2):
+            if i % args.per_device_train_batch_size < num_label1:
+                switch(index, i)
+        raw_datasets["train"] = raw_datasets["train"].select(index) 
+        
     # Labels
     if args.task_name is not None:
         is_regression = args.task_name == "stsb"
@@ -417,16 +450,27 @@ def main():
         data_collator = DataCollatorWithPadding(tokenizer, pad_to_multiple_of=(8 if accelerator.use_fp16 else None))
 
     train_dataloader = DataLoader(
-        train_dataset, shuffle=True, collate_fn=data_collator, batch_size=args.per_device_train_batch_size
+        train_dataset, shuffle=not(args.do_noniid), collate_fn=data_collator, batch_size=args.per_device_train_batch_size
     )
     eval_dataloader = DataLoader(eval_dataset, collate_fn=data_collator, batch_size=args.per_device_eval_batch_size)
 
-    with open('HANS/train_dataloader.pkl','wb') as f:
+    with open(args.output_dir + 'train_dataloader.pkl','wb') as f:
         dill.dump(train_dataloader, f)
         
-    with open('HANS/eval_dataloader.pkl','wb') as f:
+    with open(args.output_dir + 'eval_dataloader.pkl','wb') as f:
         dill.dump(eval_dataloader, f)
         
         
 if __name__ == "__main__":
     main()
+
+      
+    with open('/rds/user/lj408/hpc-work/datasets/noniid/qnli/train_dataloader.pkl','rb') as f:
+        train_dataloader = dill.load(f)
+        
+    with open('/rds/user/lj408/hpc-work/datasets/noniid/qnli/eval_dataloader.pkl','rb') as f:
+        eval_dataloader = dill.load(f)
+        
+    for step, batch in enumerate(train_dataloader):
+        print(batch)
+        break

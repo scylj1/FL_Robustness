@@ -8,7 +8,8 @@ import numpy as np
 from collections import OrderedDict
 from pathlib import Path
 from typing import Dict, Callable, Optional, Tuple, List
-from myutils import fl_partition, initialise, train, test, logger #, load_data
+from myutils import fl_partition, initialise, train, test, logger 
+from freeze import get_para_num, get_trainable_para_num, freeze_unfreeze_layers
 import argparse
 import json
 import logging
@@ -71,7 +72,11 @@ def parse_args():
     parser.add_argument("--num_client_cpus", type=int, default=3)
     parser.add_argument("--num_rounds", type=int, default=10)
     parser.add_argument("--num_clients", type=int, default=2)
-    parser.add_argument("--do_mtl", type=bool, default=False)
+    parser.add_argument("--do_noniid", type=bool, default=False)
+    parser.add_argument("--do_freeze", type=bool, default=False)
+    parser.add_argument("--num_freeze_layers", type=int, default=2)
+    parser.add_argument("--alpha", type=int, default=10, help="increase to make dataset more non-iid")
+    parser.add_argument("--beta", type=int, default=100, help="decrease to make dataset more non-iid")
     
     parser.add_argument(
         "--fed_dir_data",
@@ -215,34 +220,17 @@ class FlowerClient(fl.client.NumPyClient):
         self.args = args
         self.args.output_dir = self.args.output_dir + str(int(cid)+1)
         self.fed_dir_data = fed_dir_data
+              
+        self.model = initialise(self.args)
+        with open(self.fed_dir_data + args.task_name +'/train_dataloader.pkl','rb') as f:
+            self.train_dataloader = dill.load(f)
+        with open(self.fed_dir_data + args.task_name + '/eval_dataloader.pkl','rb') as f:
+            self.eval_dataloader = dill.load(f)
         
-        if args.do_mtl:
-            if cid == '0':
-                self.args.task_name = 'mnli'
-                self.model = initialise(self.args)
-                with open(self.fed_dir_data + 'MNLI/train_dataloader.pkl','rb') as f:
-                    self.train_dataloader = dill.load(f)
-                with open(self.fed_dir_data + 'MNLI/eval_dataloader.pkl','rb') as f:
-                    self.eval_dataloader = dill.load(f)
-            
-            if cid == '1':
-                self.args.task_name = 'qnli'
-                self.model = initialise(self.args)
-                with open(self.fed_dir_data + 'QNLI/train_dataloader.pkl','rb') as f:
-                    self.train_dataloader = dill.load(f)
-                with open(self.fed_dir_data + 'QNLI/eval_dataloader.pkl','rb') as f:
-                    self.eval_dataloader = dill.load(f)
-            
-            self.train_range = [0, len(self.train_dataloader)]
-            self.eval_range = [0, len(self.eval_dataloader)]
-            
+        if args.do_noniid:
+            self.train_range, self.eval_range = fl_partition(self.cid, len(self.train_dataloader), len(self.eval_dataloader), self.args.num_clients, alpha = args.alpha, beta = args.beta)
+        
         else:
-            self.model = initialise(self.args)
-            with open(self.fed_dir_data + 'QNLI/train_dataloader.pkl','rb') as f:
-                self.train_dataloader = dill.load(f)
-            with open(self.fed_dir_data + 'QNLI/eval_dataloader.pkl','rb') as f:
-                self.eval_dataloader = dill.load(f)
-            
             train_step = len(self.train_dataloader) // args.num_clients
             self.train_range = [int(cid) * train_step, (int(cid)+1) * train_step]
             eval_step = len(self.eval_dataloader) // args.num_clients
@@ -252,7 +240,17 @@ class FlowerClient(fl.client.NumPyClient):
                 self.train_range = [int(cid) * train_step, len(self.train_dataloader)]
                 self.eval_range = [int(cid) * eval_step, len(self.eval_dataloader)]
         
-        
+        if args.do_freeze:
+            get_para_num(self.model)
+            get_trainable_para_num(self.model)
+
+            if args.num_freeze_layers == 1:
+                freeze_unfreeze_layers(self.model, 0, unfreeze=False)
+            else:
+                freeze_unfreeze_layers(self.model, (0, args.num_freeze_layers-1), unfreeze=False)
+
+            get_para_num(self.model)
+            get_trainable_para_num(self.model)
                 
         self.properties: Dict[str, Scalar] = {"tensor_type": "numpy.ndarray"}
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu") 
@@ -304,9 +302,36 @@ def set_params(model: torch.nn.ModuleList, params: List[np.ndarray]):
     model.load_state_dict(state_dict, strict=True)
     print("###########finish################")
 
+def aggregate_weighted_average(metrics: List[Tuple[int, dict]]) -> dict:
+    """Generic function to combine results from multiple clients
+    following training or evaluation.
 
+    Args:
+        metrics (List[Tuple[int, dict]]): collected clients metrics
+
+    Returns:
+        dict: result dictionary containing the aggregate of the metrics passed.
+    """
+    average_dict: dict = defaultdict(list)
+    total_examples: int = 0
+    for num_examples, metrics_dict in metrics:
+        for key, val in metrics_dict.items():
+            if isinstance(val, numbers.Number):
+                average_dict[key].append((num_examples, val))  # type:ignore
+        total_examples += num_examples
+    return {
+        key: {
+            "avg": float(
+                sum([num_examples * metr for num_examples, metr in val])
+                / float(total_examples)
+            ),
+            "all": val,
+        }
+        for key, val in average_dict.items()
+    }
+    
 def get_evaluate_fn(
-    testset, args
+    testsets, args
 ) -> Callable[[fl.common.NDArrays], Optional[Tuple[float, float]]]:
     """Return an evaluation function for centralized evaluation."""
 
@@ -319,13 +344,16 @@ def get_evaluate_fn(
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model = initialise(args)
         
-   
-        with open(testset + 'eval_dataloader.pkl','rb') as f:
-            eval_dataloader = dill.load(f)
+        metric = {}
+        for testset in testsets:
+            with open(testset + 'eval_dataloader.pkl','rb') as f:
+                eval_dataloader = dill.load(f)
 
-        set_params(model, parameters)
-        model.to(device)
-        loss, metric = test(args, model, eval_dataloader, device, [0, len(eval_dataloader)])
+            set_params(model, parameters)
+            model.to(device)
+            loss, m = test(args, model, eval_dataloader, device, [0, len(eval_dataloader)])
+            for k, v in m.items():
+                metric[testset] =  v
         
         if args.output_dir is not None:
             out_dir = args.output_dir + "round" + str(server_round) + "/"
@@ -356,7 +384,9 @@ if __name__ == "__main__":
         "num_cpus": 7, # args.num_client_cpus,
         "num_gpus": 1
     }  
-            
+     
+    testset = [args.fed_dir_data + "hans/", args.fed_dir_data + args.task_name + "/"]  
+      
     # configure the strategy
     from fedavg import FedAvg
     strategy = FedAvg(
@@ -364,9 +394,9 @@ if __name__ == "__main__":
         fraction_evaluate=0.1,
         min_fit_clients=pool_size,
         min_evaluate_clients=pool_size,
-        min_available_clients=pool_size,  # All clients should be available
+        min_available_clients=pool_size,  
         on_fit_config_fn=fit_config,
-        evaluate_fn=get_evaluate_fn("glue_data/HANS/", args),  # centralised evaluation of global model
+        evaluate_fn=get_evaluate_fn(testset, args),  # centralised evaluation of global model
     )
 
     def client_fn(cid: str):
