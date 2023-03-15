@@ -33,46 +33,42 @@ from transformers import (
 )
 from transformers.utils import check_min_version, get_full_repo_name, send_example_telemetry
 from transformers.utils.versions import require_version
-#os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 logger = get_logger(__name__)
 
-def fl_partition(cid, train_len, eval_len, num_clients, alpha = 1, beta=100):
+# data partitioning method to create quantity skew
+def fl_partition(cid, train_len, eval_len, num_clients, alpha = 1, beta=800):
  
+    beta /= (num_clients*num_clients)
     def a_i(T, i):
-        return int(T/num_clients + (2 * i - num_clients - 1) / 2 * np.log(alpha) * T / beta)
+        return int(T/num_clients + (2 * i - num_clients - 1) / 2 * np.log(alpha) * beta)
 
     cid = int(cid)
-    t_1 = int(train_len / num_clients - (num_clients - 1) / 2 * np.log(alpha) * train_len / beta)
-    e_1 = int(eval_len / num_clients - (num_clients - 1) / 2 * np.log(alpha) * eval_len / beta)
+    t_1 = int(train_len / num_clients - (num_clients - 1) / 2 * np.log(alpha) *  beta)
+    e_1 = int(eval_len / num_clients - (num_clients - 1) / 2 * np.log(alpha) *  beta)
     train_range, eval_range = [0, max(t_1, 1)], [0, max(e_1, 1)]
     for n in range(num_clients-1):
         train_range.append(train_range[n+1] + a_i(train_len, n+2))
         eval_range.append(eval_range[n+1] + a_i(eval_len, n+2))
     train_range[-1] = train_len
     eval_range[-1] = eval_len
-
-    print(train_range)
-    print(eval_range)
     
     return train_range[cid:(cid+2)], eval_range[cid:(cid+2)]
 
-def initialise(args):
-               
+# initialse the model
+def initialise(args):             
     config = AutoConfig.from_pretrained(args.model_name_or_path, num_labels=3, finetuning_task=args.task_name)
-    #tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=not args.use_slow_tokenizer)
     model = AutoModelForSequenceClassification.from_pretrained(
         args.model_name_or_path,
         from_tf=bool(".ckpt" in args.model_name_or_path),
         config=config,
         cache_dir=args.cache_dir,
         ignore_mismatched_sizes=args.ignore_mismatched_sizes,
-    )
-          
+    )        
     return model
   
 def train(args, model, train_dataloader, device, train_range):
-    # If passed along, set the training seed now.
+    # set the training seed
     if args.seed is not None:
         set_seed(args.seed)
 
@@ -94,9 +90,6 @@ def train(args, model, train_dataloader, device, train_range):
         },
     ]
     optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
-
-    # Note -> the training dataloader needs to be prepared before we grab his length below (cause its length will be
-    # shorter in multiprocess)
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
@@ -204,7 +197,7 @@ def train(args, model, train_dataloader, device, train_range):
                         if args.output_dir is not None:
                             output_dir = os.path.join(args.output_dir, output_dir)
                         model.save_pretrained(output_dir)
-                        #accelerator.save_state(output_dir)
+   
                 progress_bar.update(1)
                 completed_steps += 1
                 if step % 1000 == 0:
@@ -216,16 +209,7 @@ def train(args, model, train_dataloader, device, train_range):
         print(f"train_loss {loss}")
         if args.checkpointing_steps == "epoch":
             output_dir = f"epoch_{epoch}"
-
-    end = time.perf_counter()
-    train_time = round(end-start)
-    '''with open(os.path.join(args.output_dir, "train_results.json"), "a+") as f:
-        json.dump({"train loss": float(loss) , "train time(s)": float(train_time)}, f)'''
-    '''if args.output_dir is not None:
-        model.save_pretrained(
-            args.output_dir
-        )'''
-        
+     
             
 def test(args, model, eval_dataloader, device, eval_range):
     loss = 0   
@@ -264,15 +248,7 @@ def test(args, model, eval_dataloader, device, eval_range):
     eval_loss = loss / (eval_range[1] - eval_range[0])
     eval_metric = metric.compute()
     print(f"metric: {eval_metric}")
-    
-    '''if args.output_dir is not None:
-        all_results = {f"eval_{k}": v for k, v in eval_metric.items()}
-        with open(os.path.join(args.output_dir, "all_results.json"), "w") as f:
-            json.dump(all_results, f)'''
             
     return float(eval_loss), eval_metric
 
-if __name__ == "__main__":
-    print(1)
-    fl_partition("0", 10000, 100, 5, alpha = 100000)
 

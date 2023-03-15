@@ -9,6 +9,7 @@ from transformers import (
     get_scheduler,
 )
 
+# Freeze selected layers
 def freeze_unfreeze_layers(model, layer_indexs, unfreeze=False):
     if type(layer_indexs) == int:
       for name, param in model.named_parameters():
@@ -28,19 +29,22 @@ def freeze_unfreeze_layers(model, layer_indexs, unfreeze=False):
                 param.requires_grad_(unfreeze)
       print(f"successfully freeze layers indexs from: {layer_indexs[0]} to: {layer_indexs[1]}, including {layer_indexs[1]}")
 
+# get the number of all parameters
 def get_para_num(model):
     lst = []
     for para in model.parameters():
         lst.append(para.nelement())
     print(f"total paras number: {sum(lst)}")
 
+# get the number of trainable parameters
 def get_trainable_para_num(model):
     lst = []
     for para in model.parameters():
         if para.requires_grad == True:
             lst.append(para.nelement())
     print(f"trainable paras number: {sum(lst)}")
-    
+
+# check if the freezing method works properly      
 def test():
     config = AutoConfig.from_pretrained('bert-base-uncased')
     model = AutoModelForMaskedLM.from_pretrained(
@@ -56,6 +60,6 @@ def test():
 
     get_para_num(model)
     get_trainable_para_num(model)
-    
+ 
 if __name__ == "__main__":
     test()

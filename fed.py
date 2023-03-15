@@ -44,13 +44,9 @@ import dill
 from transformers.utils import check_min_version, get_full_repo_name, send_example_telemetry
 from transformers.utils.versions import require_version
 
-#os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
 require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/language-modeling/requirements.txt")
 MODEL_CONFIG_CLASSES = list(MODEL_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
-#RAY_ADDRESS="128.232.115.65:6379"
-
      
 task_to_keys = {
     "cola": ("sentence", None),
@@ -69,14 +65,15 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Finetune a transformers model on a text classification task")
     parser = argparse.ArgumentParser(description="Flower Simulation with bert")
 
-    parser.add_argument("--num_client_cpus", type=int, default=3)
+    parser.add_argument("--num_client_cpus", type=int, default=7)
+    parser.add_argument("--num_client_gpus", type=int, default=1)
     parser.add_argument("--num_rounds", type=int, default=10)
     parser.add_argument("--num_clients", type=int, default=2)
     parser.add_argument("--do_noniid", type=bool, default=False)
     parser.add_argument("--do_freeze", type=bool, default=False)
     parser.add_argument("--num_freeze_layers", type=int, default=2)
     parser.add_argument("--alpha", type=int, default=10, help="increase to make dataset more non-iid")
-    parser.add_argument("--beta", type=int, default=100, help="decrease to make dataset more non-iid")
+    parser.add_argument("--beta", type=int, default=800, help="decrease to make dataset more non-iid")
     
     parser.add_argument(
         "--fed_dir_data",
@@ -213,20 +210,22 @@ def parse_args():
     
     return args
             
-# Flower client, adapted from Pytorch quickstart example
+# Flower client
 class FlowerClient(fl.client.NumPyClient):
     def __init__(self, cid: str, fed_dir_data: str, args):
         self.cid = cid
         self.args = args
         self.args.output_dir = self.args.output_dir + str(int(cid)+1)
-        self.fed_dir_data = fed_dir_data
-              
+        self.fed_dir_data = fed_dir_data           
         self.model = initialise(self.args)
+        
+        # load datasets
         with open(self.fed_dir_data + args.task_name +'/train_dataloader.pkl','rb') as f:
             self.train_dataloader = dill.load(f)
         with open(self.fed_dir_data + args.task_name + '/eval_dataloader.pkl','rb') as f:
             self.eval_dataloader = dill.load(f)
         
+        # split datasets based on iid and non-iid settings
         if args.do_noniid:
             self.train_range, self.eval_range = fl_partition(self.cid, len(self.train_dataloader), len(self.eval_dataloader), self.args.num_clients, alpha = args.alpha, beta = args.beta)
         
@@ -240,15 +239,14 @@ class FlowerClient(fl.client.NumPyClient):
                 self.train_range = [int(cid) * train_step, len(self.train_dataloader)]
                 self.eval_range = [int(cid) * eval_step, len(self.eval_dataloader)]
         
+        # whether adopting layer freezing method
         if args.do_freeze:
             get_para_num(self.model)
             get_trainable_para_num(self.model)
-
             if args.num_freeze_layers == 1:
                 freeze_unfreeze_layers(self.model, 0, unfreeze=False)
             else:
                 freeze_unfreeze_layers(self.model, (0, args.num_freeze_layers-1), unfreeze=False)
-
             get_para_num(self.model)
             get_trainable_para_num(self.model)
                 
@@ -261,21 +259,14 @@ class FlowerClient(fl.client.NumPyClient):
 
     def fit(self, parameters, config):
         set_params(self.model, parameters)
-       # num_workers = int(ray.get_runtime_context().get_assigned_resources()["CPU"])
-        
-        print("Training Started...")
         train(self.args, self.model.to(self.device), self.train_dataloader, self.device,self.train_range)
-        print("Training Finished...")
         # Return local model and statistics
         return get_params(self.model), (self.train_range[1] - self.train_range[0]), {}
 
     def evaluate(self, parameters, config):
-        set_params(self.model, parameters)
-        #num_workers = int(ray.get_runtime_context().get_assigned_resources()["CPU"])     
-    
+        set_params(self.model, parameters)     
         # Evaluate       
         loss, metric = test(self.args, self.model.to(self.device), self.eval_dataloader, self.device, self.eval_range)
-        print("Evaluating finished...")
         # Return statistics
         return float(loss), (self.eval_range[1] - self.eval_range[0]), metric
     
@@ -283,8 +274,8 @@ class FlowerClient(fl.client.NumPyClient):
 def fit_config(server_round: int) -> Dict[str, Scalar]:
     """Return a configuration with static batch size and (local) epochs."""
     config = {
-        "epochs": 1,  # number of local epochs
-        "batch_size": 8,
+        "epochs": 1,  
+        "batch_size": 16,
     }
     return config
 
@@ -296,11 +287,9 @@ def get_params(model: torch.nn.ModuleList) -> List[np.ndarray]:
 
 def set_params(model: torch.nn.ModuleList, params: List[np.ndarray]):
     """Set model weights from a list of NumPy ndarrays."""
-    print("###########setting#################")
     params_dict = zip(model.state_dict().keys(), params)
     state_dict = OrderedDict({k: torch.from_numpy(np.copy(v)) for k, v in params_dict})
     model.load_state_dict(state_dict, strict=True)
-    print("###########finish################")
 
 def aggregate_weighted_average(metrics: List[Tuple[int, dict]]) -> dict:
     """Generic function to combine results from multiple clients
@@ -317,7 +306,7 @@ def aggregate_weighted_average(metrics: List[Tuple[int, dict]]) -> dict:
     for num_examples, metrics_dict in metrics:
         for key, val in metrics_dict.items():
             if isinstance(val, numbers.Number):
-                average_dict[key].append((num_examples, val))  # type:ignore
+                average_dict[key].append((num_examples, val)) 
         total_examples += num_examples
     return {
         key: {
@@ -344,6 +333,7 @@ def get_evaluate_fn(
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model = initialise(args)
         
+        # evaluate on testsets
         metric = {}
         for testset in testsets:
             with open(testset + 'eval_dataloader.pkl','rb') as f:
@@ -355,6 +345,7 @@ def get_evaluate_fn(
             for k, v in m.items():
                 metric[testset] =  v
         
+        # save evaluation results and trained models
         if args.output_dir is not None:
             out_dir = args.output_dir + "round" + str(server_round) + "/"
             folder = os.path.exists(out_dir)
@@ -371,44 +362,41 @@ def get_evaluate_fn(
 
     return evaluate
 
-
-# Start simulation (a _default server_ will be created)
-
 if __name__ == "__main__":
 
     # parse input arguments
     args = parse_args()
     
-    pool_size = args.num_clients  # number of dataset partions (= number of total clients)
+    # configure clients
+    pool_size = args.num_clients
     client_resources = {
-        "num_cpus": 7, # args.num_client_cpus,
-        "num_gpus": 1
+        "num_cpus": args.num_client_cpus, 
+        "num_gpus": args.num_client_gpus
     }  
-     
+    
+    # configure testset
     testset = [args.fed_dir_data + "hans/", args.fed_dir_data + args.task_name + "/"]  
       
     # configure the strategy
-    from fedavg import FedAvg
-    strategy = FedAvg(
+    strategy = fl.server.strategy.FedAvg(
         fraction_fit=0.1,
         fraction_evaluate=0.1,
         min_fit_clients=pool_size,
         min_evaluate_clients=pool_size,
         min_available_clients=pool_size,  
         on_fit_config_fn=fit_config,
-        evaluate_fn=get_evaluate_fn(testset, args),  # centralised evaluation of global model
+        evaluate_fn=get_evaluate_fn(testset, args), 
     )
 
     def client_fn(cid: str):
-        # create a single client instance
+        # create client instance
         return FlowerClient(cid, args.fed_dir_data, args)
 
     # (optional) specify Ray config
     ray_init_args = {"include_dashboard": False}
 
-    from app import start_simulation
     # start simulation
-    hist = start_simulation(
+    hist =  fl.simulation.start_simulation(
         client_fn=client_fn,
         num_clients=pool_size,
         client_resources=client_resources,
